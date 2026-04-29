@@ -23,7 +23,6 @@ jobs:
       - name: Get PR changes (diff + file list)
         id: pr_changes
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -49,7 +48,7 @@ jobs:
       - name: Call AI for 2-line summary
         id: ai_summary
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPAI }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -126,53 +125,88 @@ jobs:
             echo "key=$KEY"     >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Update Jira field with AI summary
-        if: steps.jira_key.outputs.found == 'true'
+      - name: Show AI summary in workflow output (Jira update disabled)
         env:
-          JIRA_BASE_URL:  ${{ secrets.JIRA_BASE_URL }}      # e.g. https://your-org.atlassian.net
-          JIRA_EMAIL:     ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          # Field to update. Defaults to the built-in "description".
-          # For a custom field set repo variable JIRA_FIELD_ID to e.g. "customfield_10010".
-          JIRA_FIELD_ID:  ${{ vars.JIRA_FIELD_ID || 'description' }}
-          JIRA_KEY:       ${{ steps.jira_key.outputs.key }}
-          SUMMARY:        ${{ steps.ai_summary.outputs.summary }}
+          JIRA_KEY: ${{ steps.jira_key.outputs.key }}
+          JIRA_FOUND: ${{ steps.jira_key.outputs.found }}
+          SUMMARY: ${{ steps.ai_summary.outputs.summary }}
         run: |
           set -euo pipefail
 
-          # Jira Cloud requires ADF for rich-text fields like "description".
-          # Plain custom text fields accept a string. We send ADF when the
-          # target field is "description", otherwise a plain string.
-          if [ "$JIRA_FIELD_ID" = "description" ]; then
-            FIELD_VALUE=$(jq -n --arg s "$SUMMARY" '
-              {
-                type: "doc",
-                version: 1,
-                content: [
-                  { type: "paragraph",
-                    content: [ { type: "text", text: $s } ] }
-                ]
-              }')
-            BODY=$(jq -n --arg fid "$JIRA_FIELD_ID" --argjson val "$FIELD_VALUE" \
-              '{fields: { ($fid): $val }}')
+          echo "===== AI-generated PR summary ====="
+          echo "$SUMMARY"
+          echo "==================================="
+
+          if [ "$JIRA_FOUND" = "true" ]; then
+            echo "Detected Jira key: $JIRA_KEY (Jira update is currently disabled)"
           else
-            BODY=$(jq -n --arg fid "$JIRA_FIELD_ID" --arg val "$SUMMARY" \
-              '{fields: { ($fid): $val }}')
+            echo "No Jira key found in PR title/branch/body."
           fi
 
-          HTTP_CODE=$(curl -sS -o /tmp/jira_resp.txt -w "%{http_code}" \
-            -X PUT \
-            -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
-            -H "Content-Type: application/json" \
-            "$JIRA_BASE_URL/rest/api/3/issue/$JIRA_KEY" \
-            -d "$BODY")
+          # Also publish to the GitHub Actions job summary (rendered on the run page)
+          {
+            echo "## AI PR Summary"
+            echo ""
+            echo '```'
+            echo "$SUMMARY"
+            echo '```'
+            if [ "$JIRA_FOUND" = "true" ]; then
+              echo ""
+              echo "**Detected Jira key:** \`$JIRA_KEY\` _(update disabled)_"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "Jira responded with HTTP $HTTP_CODE"
-          cat /tmp/jira_resp.txt || true
-
-          if [ "$HTTP_CODE" != "204" ]; then
-            echo "Failed to update Jira issue $JIRA_KEY"
-            exit 1
-          fi
-
-          echo "Updated Jira issue $JIRA_KEY field '$JIRA_FIELD_ID' successfully."
+      # ---------------------------------------------------------------------
+      # Jira update is intentionally disabled for now. Uncomment this step
+      # (and add the JIRA_* secrets) when you're ready to push to Jira.
+      # ---------------------------------------------------------------------
+      # - name: Update Jira field with AI summary
+      #   if: steps.jira_key.outputs.found == 'true'
+      #   env:
+      #     JIRA_BASE_URL:  ${{ secrets.JIRA_BASE_URL }}      # e.g. https://your-org.atlassian.net
+      #     JIRA_EMAIL:     ${{ secrets.JIRA_EMAIL }}
+      #     JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      #     # Field to update. Defaults to the built-in "description".
+      #     # For a custom field set repo variable JIRA_FIELD_ID to e.g. "customfield_10010".
+      #     JIRA_FIELD_ID:  ${{ vars.JIRA_FIELD_ID || 'description' }}
+      #     JIRA_KEY:       ${{ steps.jira_key.outputs.key }}
+      #     SUMMARY:        ${{ steps.ai_summary.outputs.summary }}
+      #   run: |
+      #     set -euo pipefail
+      #
+      #     # Jira Cloud requires ADF for rich-text fields like "description".
+      #     # Plain custom text fields accept a string. We send ADF when the
+      #     # target field is "description", otherwise a plain string.
+      #     if [ "$JIRA_FIELD_ID" = "description" ]; then
+      #       FIELD_VALUE=$(jq -n --arg s "$SUMMARY" '
+      #         {
+      #           type: "doc",
+      #           version: 1,
+      #           content: [
+      #             { type: "paragraph",
+      #               content: [ { type: "text", text: $s } ] }
+      #           ]
+      #         }')
+      #       BODY=$(jq -n --arg fid "$JIRA_FIELD_ID" --argjson val "$FIELD_VALUE" \
+      #         '{fields: { ($fid): $val }}')
+      #     else
+      #       BODY=$(jq -n --arg fid "$JIRA_FIELD_ID" --arg val "$SUMMARY" \
+      #         '{fields: { ($fid): $val }}')
+      #     fi
+      #
+      #     HTTP_CODE=$(curl -sS -o /tmp/jira_resp.txt -w "%{http_code}" \
+      #       -X PUT \
+      #       -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+      #       -H "Content-Type: application/json" \
+      #       "$JIRA_BASE_URL/rest/api/3/issue/$JIRA_KEY" \
+      #       -d "$BODY")
+      #
+      #     echo "Jira responded with HTTP $HTTP_CODE"
+      #     cat /tmp/jira_resp.txt || true
+      #
+      #     if [ "$HTTP_CODE" != "204" ]; then
+      #       echo "Failed to update Jira issue $JIRA_KEY"
+      #       exit 1
+      #     fi
+      #
+      #     echo "Updated Jira issue $JIRA_KEY field '$JIRA_FIELD_ID' successfully."
