@@ -1,69 +1,93 @@
-name: PR Merge - AI Summary to Jira
+name: Commit - AI Summary (Jira disabled)
 
-# Triggered when a PR is closed; we only proceed if it was merged.
+# Run on every push (i.e. whenever new commits land on a branch).
 on:
-  pull_request:
-    types: [closed]
+  push:
+    branches:
+      - "**"   # all branches; restrict to e.g. [main] if you only want default branch
 
 permissions:
   contents: read
-  pull-requests: read
 
 jobs:
   summarize-and-update-jira:
-    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0   # need history so we can diff against the previous commit
 
-      - name: Get PR changes (diff + file list)
-        id: pr_changes
+      - name: Resolve commit range
+        id: range
         env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA:  ${{ github.event.after }}
         run: |
           set -euo pipefail
-          mkdir -p .pr-context
 
-          # PR title + body
-          jq -n \
-            --arg title "${{ github.event.pull_request.title }}" \
-            --arg body  "${{ github.event.pull_request.body }}" \
-            '{title:$title, body:$body}' > .pr-context/meta.json
+          # On the first push to a new branch, BEFORE_SHA is all zeros.
+          # In that case, diff against the parent of the new HEAD.
+          ZERO="0000000000000000000000000000000000000000"
+          if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "$ZERO" ]; then
+            BASE_SHA=$(git rev-parse "${AFTER_SHA}^" 2>/dev/null || echo "")
+            if [ -z "$BASE_SHA" ]; then
+              # Brand new repo / orphan commit -> diff against the empty tree.
+              BASE_SHA=$(git hash-object -t tree /dev/null)
+            fi
+          else
+            BASE_SHA="$BEFORE_SHA"
+          fi
 
-          # Diff (truncate to keep prompt reasonable for the model)
-          git diff --no-color "$BASE_SHA" "$HEAD_SHA" > .pr-context/full.diff || true
-          head -c 60000 .pr-context/full.diff > .pr-context/diff.txt
+          echo "base=$BASE_SHA"  >> "$GITHUB_OUTPUT"
+          echo "head=$AFTER_SHA" >> "$GITHUB_OUTPUT"
+          echo "Diffing $BASE_SHA..$AFTER_SHA"
 
-          # Changed files list
-          git diff --name-status "$BASE_SHA" "$HEAD_SHA" > .pr-context/files.txt || true
+      - name: Get commit changes (diff + file list + messages)
+        id: changes
+        env:
+          BASE_SHA: ${{ steps.range.outputs.base }}
+          HEAD_SHA: ${{ steps.range.outputs.head }}
+        run: |
+          set -euo pipefail
+          mkdir -p .commit-context
 
-          echo "diff_bytes=$(wc -c < .pr-context/diff.txt)" >> "$GITHUB_OUTPUT"
+          # Unified diff (truncate to keep prompt size sane)
+          git diff --no-color "$BASE_SHA" "$HEAD_SHA" > .commit-context/full.diff || true
+          head -c 60000 .commit-context/full.diff > .commit-context/diff.txt
+
+          # Changed files
+          git diff --name-status "$BASE_SHA" "$HEAD_SHA" > .commit-context/files.txt || true
+
+          # Commit messages in this push
+          git log --pretty=format:'- %h %s%n%b' "$BASE_SHA..$HEAD_SHA" \
+            > .commit-context/messages.txt || true
+
+          echo "diff_bytes=$(wc -c < .commit-context/diff.txt)" >> "$GITHUB_OUTPUT"
 
       - name: Call AI for 2-line summary
         id: ai_summary
         env:
           OPENAI_API_KEY: ${{ secrets.OPAI }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BRANCH: ${{ github.ref_name }}
+          PUSHER: ${{ github.actor }}
         run: |
           set -euo pipefail
 
-          DIFF_CONTENT=$(cat .pr-context/diff.txt)
-          FILES_CONTENT=$(cat .pr-context/files.txt)
+          DIFF_CONTENT=$(cat .commit-context/diff.txt)
+          FILES_CONTENT=$(cat .commit-context/files.txt)
+          MESSAGES_CONTENT=$(cat .commit-context/messages.txt)
 
           # Build JSON payload safely with jq
           PROMPT=$(jq -n \
-            --arg title "$PR_TITLE" \
-            --arg files "$FILES_CONTENT" \
-            --arg diff  "$DIFF_CONTENT" \
-            '"You are a release-notes assistant. Summarize the following merged pull request in EXACTLY 2 concise lines (max ~220 chars total). Focus on what changed and why it matters. No bullet points, no markdown.\n\nPR Title: " + $title + "\n\nChanged files:\n" + $files + "\n\nUnified diff (may be truncated):\n" + $diff')
+            --arg branch  "$BRANCH" \
+            --arg pusher  "$PUSHER" \
+            --arg msgs    "$MESSAGES_CONTENT" \
+            --arg files   "$FILES_CONTENT" \
+            --arg diff    "$DIFF_CONTENT" \
+            '"You are a release-notes assistant. Summarize the following push (one or more commits) in EXACTLY 2 concise lines (max ~220 chars total). Focus on what changed and why it matters. No bullet points, no markdown.\n\nBranch: " + $branch + "\nAuthor: " + $pusher + "\n\nCommit messages:\n" + $msgs + "\n\nChanged files:\n" + $files + "\n\nUnified diff (may be truncated):\n" + $diff')
 
           PAYLOAD=$(jq -n \
             --arg model "$OPENAI_MODEL" \
@@ -71,7 +95,7 @@ jobs:
             '{
                model: $model,
                messages: [
-                 {role: "system", content: "You write crisp, factual 2-line PR summaries for Jira."},
+                 {role: "system", content: "You write crisp, factual 2-line commit summaries for Jira."},
                  {role: "user",   content: $prompt}
                ],
                temperature: 0.2
@@ -105,19 +129,18 @@ jobs:
       - name: Extract Jira issue key
         id: jira_key
         env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_BODY:  ${{ github.event.pull_request.body }}
-          BRANCH:   ${{ github.event.pull_request.head.ref }}
+          BRANCH: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          # Look for KEY-123 style ids in title, branch, then body (in that priority).
+          # Look for KEY-123 style ids in commit messages first, then branch name.
           REGEX='[A-Z][A-Z0-9]+-[0-9]+'
-          KEY=$(echo "$PR_TITLE" | grep -oE "$REGEX" | head -n1 || true)
+          MESSAGES=$(cat .commit-context/messages.txt || true)
+
+          KEY=$(echo "$MESSAGES" | grep -oE "$REGEX" | head -n1 || true)
           if [ -z "$KEY" ]; then KEY=$(echo "$BRANCH" | grep -oE "$REGEX" | head -n1 || true); fi
-          if [ -z "$KEY" ]; then KEY=$(echo "$PR_BODY"  | grep -oE "$REGEX" | head -n1 || true); fi
 
           if [ -z "$KEY" ]; then
-            echo "No Jira issue key (e.g. ABC-123) found in PR title/branch/body. Skipping update."
+            echo "No Jira issue key (e.g. ABC-123) found in commit messages or branch."
             echo "found=false" >> "$GITHUB_OUTPUT"
           else
             echo "Found Jira key: $KEY"
@@ -133,19 +156,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "===== AI-generated PR summary ====="
+          echo "===== AI-generated commit summary ====="
           echo "$SUMMARY"
-          echo "==================================="
+          echo "======================================="
 
           if [ "$JIRA_FOUND" = "true" ]; then
             echo "Detected Jira key: $JIRA_KEY (Jira update is currently disabled)"
           else
-            echo "No Jira key found in PR title/branch/body."
+            echo "No Jira key found in commit messages / branch."
           fi
 
           # Also publish to the GitHub Actions job summary (rendered on the run page)
           {
-            echo "## AI PR Summary"
+            echo "## AI Commit Summary"
             echo ""
             echo '```'
             echo "$SUMMARY"
@@ -174,9 +197,6 @@ jobs:
       #   run: |
       #     set -euo pipefail
       #
-      #     # Jira Cloud requires ADF for rich-text fields like "description".
-      #     # Plain custom text fields accept a string. We send ADF when the
-      #     # target field is "description", otherwise a plain string.
       #     if [ "$JIRA_FIELD_ID" = "description" ]; then
       #       FIELD_VALUE=$(jq -n --arg s "$SUMMARY" '
       #         {
