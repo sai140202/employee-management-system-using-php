@@ -71,7 +71,7 @@ jobs:
         env:
           # Create the secret with: gh secret set GEMINI_API_KEY
           # Get a key at https://aistudio.google.com/apikey
-          GEMINI_API_KEY: ${{ secrets.GEMAI }}
+          GEMINI_API_KEY: ${{ secrets.GEMAI  }}
           # Override via repo variable GEMINI_MODEL if you want, e.g. gemini-2.5-flash
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.0-flash' }}
           BRANCH: ${{ github.ref_name }}
