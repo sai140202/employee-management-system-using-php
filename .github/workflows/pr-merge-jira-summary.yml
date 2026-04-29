@@ -66,21 +66,29 @@ jobs:
 
           echo "diff_bytes=$(wc -c < .commit-context/diff.txt)" >> "$GITHUB_OUTPUT"
 
-      - name: Call AI for 2-line summary
+      - name: Call AI for 2-line summary (Google AI Studio / Gemini)
         id: ai_summary
         env:
-          OPENAI_API_KEY: ${{ secrets.OPAI }}
-          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}
+          # Create the secret with: gh secret set GEMINI_API_KEY
+          # Get a key at https://aistudio.google.com/apikey
+          GEMINI_API_KEY: ${{ secrets.GEMAI }}
+          # Override via repo variable GEMINI_MODEL if you want, e.g. gemini-2.5-flash
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.0-flash' }}
           BRANCH: ${{ github.ref_name }}
           PUSHER: ${{ github.actor }}
         run: |
           set -euo pipefail
 
+          if [ -z "${GEMINI_API_KEY:-}" ]; then
+            echo "GEMINI_API_KEY secret is not set. Add it under repo Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
           DIFF_CONTENT=$(cat .commit-context/diff.txt)
           FILES_CONTENT=$(cat .commit-context/files.txt)
           MESSAGES_CONTENT=$(cat .commit-context/messages.txt)
 
-          # Build JSON payload safely with jq
+          # Build the prompt text safely with jq
           PROMPT=$(jq -n \
             --arg branch  "$BRANCH" \
             --arg pusher  "$PUSHER" \
@@ -89,24 +97,29 @@ jobs:
             --arg diff    "$DIFF_CONTENT" \
             '"You are a release-notes assistant. Summarize the following push (one or more commits) in EXACTLY 2 concise lines (max ~220 chars total). Focus on what changed and why it matters. No bullet points, no markdown.\n\nBranch: " + $branch + "\nAuthor: " + $pusher + "\n\nCommit messages:\n" + $msgs + "\n\nChanged files:\n" + $files + "\n\nUnified diff (may be truncated):\n" + $diff')
 
-          PAYLOAD=$(jq -n \
-            --arg model "$OPENAI_MODEL" \
-            --arg prompt "$PROMPT" \
-            '{
-               model: $model,
-               messages: [
-                 {role: "system", content: "You write crisp, factual 2-line commit summaries for Jira."},
-                 {role: "user",   content: $prompt}
-               ],
-               temperature: 0.2
-             }')
+          # Gemini generateContent payload
+          PAYLOAD=$(jq -n --arg prompt "$PROMPT" '
+            {
+              contents: [
+                { role: "user", parts: [ { text: $prompt } ] }
+              ],
+              generationConfig: {
+                temperature: 0.2,
+                maxOutputTokens: 200
+              }
+            }')
 
-          RESPONSE=$(curl -sS https://api.openai.com/v1/chat/completions \
-            -H "Authorization: Bearer $OPENAI_API_KEY" \
+          RESPONSE=$(curl -sS \
+            "https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
 
-          SUMMARY=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+          # Concatenate all text parts from the first candidate
+          SUMMARY=$(echo "$RESPONSE" | jq -r '
+            (.candidates[0].content.parts // [])
+            | map(.text // "")
+            | join("")
+          ')
 
           if [ -z "$SUMMARY" ]; then
             echo "AI response did not contain a summary:"
