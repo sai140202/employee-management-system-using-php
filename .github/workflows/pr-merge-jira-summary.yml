@@ -1,0 +1,178 @@
+name: PR Merge - AI Summary to Jira
+
+# Triggered when a PR is closed; we only proceed if it was merged.
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  summarize-and-update-jira:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR changes (diff + file list)
+        id: pr_changes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p .pr-context
+
+          # PR title + body
+          jq -n \
+            --arg title "${{ github.event.pull_request.title }}" \
+            --arg body  "${{ github.event.pull_request.body }}" \
+            '{title:$title, body:$body}' > .pr-context/meta.json
+
+          # Diff (truncate to keep prompt reasonable for the model)
+          git diff --no-color "$BASE_SHA" "$HEAD_SHA" > .pr-context/full.diff || true
+          head -c 60000 .pr-context/full.diff > .pr-context/diff.txt
+
+          # Changed files list
+          git diff --name-status "$BASE_SHA" "$HEAD_SHA" > .pr-context/files.txt || true
+
+          echo "diff_bytes=$(wc -c < .pr-context/diff.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Call AI for 2-line summary
+        id: ai_summary
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4o-mini' }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          DIFF_CONTENT=$(cat .pr-context/diff.txt)
+          FILES_CONTENT=$(cat .pr-context/files.txt)
+
+          # Build JSON payload safely with jq
+          PROMPT=$(jq -n \
+            --arg title "$PR_TITLE" \
+            --arg files "$FILES_CONTENT" \
+            --arg diff  "$DIFF_CONTENT" \
+            '"You are a release-notes assistant. Summarize the following merged pull request in EXACTLY 2 concise lines (max ~220 chars total). Focus on what changed and why it matters. No bullet points, no markdown.\n\nPR Title: " + $title + "\n\nChanged files:\n" + $files + "\n\nUnified diff (may be truncated):\n" + $diff')
+
+          PAYLOAD=$(jq -n \
+            --arg model "$OPENAI_MODEL" \
+            --arg prompt "$PROMPT" \
+            '{
+               model: $model,
+               messages: [
+                 {role: "system", content: "You write crisp, factual 2-line PR summaries for Jira."},
+                 {role: "user",   content: $prompt}
+               ],
+               temperature: 0.2
+             }')
+
+          RESPONSE=$(curl -sS https://api.openai.com/v1/chat/completions \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          SUMMARY=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+
+          if [ -z "$SUMMARY" ]; then
+            echo "AI response did not contain a summary:"
+            echo "$RESPONSE"
+            exit 1
+          fi
+
+          # Normalize to 2 lines max
+          SUMMARY=$(printf "%s" "$SUMMARY" | sed '/^\s*$/d' | head -n 2)
+
+          echo "Generated summary:"
+          echo "$SUMMARY"
+
+          {
+            echo 'summary<<EOF'
+            echo "$SUMMARY"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Extract Jira issue key
+        id: jira_key
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY:  ${{ github.event.pull_request.body }}
+          BRANCH:   ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          # Look for KEY-123 style ids in title, branch, then body (in that priority).
+          REGEX='[A-Z][A-Z0-9]+-[0-9]+'
+          KEY=$(echo "$PR_TITLE" | grep -oE "$REGEX" | head -n1 || true)
+          if [ -z "$KEY" ]; then KEY=$(echo "$BRANCH" | grep -oE "$REGEX" | head -n1 || true); fi
+          if [ -z "$KEY" ]; then KEY=$(echo "$PR_BODY"  | grep -oE "$REGEX" | head -n1 || true); fi
+
+          if [ -z "$KEY" ]; then
+            echo "No Jira issue key (e.g. ABC-123) found in PR title/branch/body. Skipping update."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Found Jira key: $KEY"
+            echo "found=true"   >> "$GITHUB_OUTPUT"
+            echo "key=$KEY"     >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update Jira field with AI summary
+        if: steps.jira_key.outputs.found == 'true'
+        env:
+          JIRA_BASE_URL:  ${{ secrets.JIRA_BASE_URL }}      # e.g. https://your-org.atlassian.net
+          JIRA_EMAIL:     ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          # Field to update. Defaults to the built-in "description".
+          # For a custom field set repo variable JIRA_FIELD_ID to e.g. "customfield_10010".
+          JIRA_FIELD_ID:  ${{ vars.JIRA_FIELD_ID || 'description' }}
+          JIRA_KEY:       ${{ steps.jira_key.outputs.key }}
+          SUMMARY:        ${{ steps.ai_summary.outputs.summary }}
+        run: |
+          set -euo pipefail
+
+          # Jira Cloud requires ADF for rich-text fields like "description".
+          # Plain custom text fields accept a string. We send ADF when the
+          # target field is "description", otherwise a plain string.
+          if [ "$JIRA_FIELD_ID" = "description" ]; then
+            FIELD_VALUE=$(jq -n --arg s "$SUMMARY" '
+              {
+                type: "doc",
+                version: 1,
+                content: [
+                  { type: "paragraph",
+                    content: [ { type: "text", text: $s } ] }
+                ]
+              }')
+            BODY=$(jq -n --arg fid "$JIRA_FIELD_ID" --argjson val "$FIELD_VALUE" \
+              '{fields: { ($fid): $val }}')
+          else
+            BODY=$(jq -n --arg fid "$JIRA_FIELD_ID" --arg val "$SUMMARY" \
+              '{fields: { ($fid): $val }}')
+          fi
+
+          HTTP_CODE=$(curl -sS -o /tmp/jira_resp.txt -w "%{http_code}" \
+            -X PUT \
+            -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            "$JIRA_BASE_URL/rest/api/3/issue/$JIRA_KEY" \
+            -d "$BODY")
+
+          echo "Jira responded with HTTP $HTTP_CODE"
+          cat /tmp/jira_resp.txt || true
+
+          if [ "$HTTP_CODE" != "204" ]; then
+            echo "Failed to update Jira issue $JIRA_KEY"
+            exit 1
+          fi
+
+          echo "Updated Jira issue $JIRA_KEY field '$JIRA_FIELD_ID' successfully."
