@@ -1,16 +1,16 @@
-name: Commit - AI Summary (Jira disabled)
+name: PR Merge - AI Summary & Jira Update
 
-# Run on every push (i.e. whenever new commits land on a branch).
+# Run only when a pull request is merged.
 on:
-  push:
-    branches:
-      - "**"   # all branches; restrict to e.g. [main] if you only want default branch
+  pull_request:
+    types: [closed]
 
 permissions:
   contents: read
 
 jobs:
   summarize-and-update-jira:
+    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
 
     steps:
@@ -22,27 +22,13 @@ jobs:
       - name: Resolve commit range
         id: range
         env:
-          BEFORE_SHA: ${{ github.event.before }}
-          AFTER_SHA:  ${{ github.event.after }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-
-          # On the first push to a new branch, BEFORE_SHA is all zeros.
-          # In that case, diff against the parent of the new HEAD.
-          ZERO="0000000000000000000000000000000000000000"
-          if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "$ZERO" ]; then
-            BASE_SHA=$(git rev-parse "${AFTER_SHA}^" 2>/dev/null || echo "")
-            if [ -z "$BASE_SHA" ]; then
-              # Brand new repo / orphan commit -> diff against the empty tree.
-              BASE_SHA=$(git hash-object -t tree /dev/null)
-            fi
-          else
-            BASE_SHA="$BEFORE_SHA"
-          fi
-
-          echo "base=$BASE_SHA"  >> "$GITHUB_OUTPUT"
-          echo "head=$AFTER_SHA" >> "$GITHUB_OUTPUT"
-          echo "Diffing $BASE_SHA..$AFTER_SHA"
+          echo "base=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "Diffing $BASE_SHA..$HEAD_SHA"
 
       - name: Get commit changes (diff + file list + messages)
         id: changes
@@ -53,9 +39,8 @@ jobs:
           set -euo pipefail
           mkdir -p .commit-context
 
-          # Unified diff (truncate to keep prompt size sane)
+          # Unified diff
           git diff --no-color "$BASE_SHA" "$HEAD_SHA" > .commit-context/full.diff || true
-          head -c 60000 .commit-context/full.diff > .commit-context/diff.txt
 
           # Changed files
           git diff --name-status "$BASE_SHA" "$HEAD_SHA" > .commit-context/files.txt || true
@@ -64,7 +49,34 @@ jobs:
           git log --pretty=format:'- %h %s%n%b' "$BASE_SHA..$HEAD_SHA" \
             > .commit-context/messages.txt || true
 
-          echo "diff_bytes=$(wc -c < .commit-context/diff.txt)" >> "$GITHUB_OUTPUT"
+          # Detect large diffs and build a compact representation instead of raw diff
+          DIFF_LINES=$(wc -l < .commit-context/full.diff)
+          LARGE_DIFF_THRESHOLD=500
+
+          if [ "$DIFF_LINES" -gt "$LARGE_DIFF_THRESHOLD" ]; then
+            echo "Diff is ${DIFF_LINES} lines (>${LARGE_DIFF_THRESHOLD}) — switching to stat + per-file samples."
+
+            # Overall stat (e.g. 12 files changed, 1234 insertions, 56 deletions)
+            git diff --stat "$BASE_SHA" "$HEAD_SHA" > .commit-context/diff_stat.txt || true
+
+            # First 30 lines of diff per changed file (up to 20 files)
+            > .commit-context/diff_samples.txt
+            while IFS= read -r filepath; do
+              echo "=== $filepath ===" >> .commit-context/diff_samples.txt
+              git diff --no-color "$BASE_SHA" "$HEAD_SHA" -- "$filepath" \
+                | head -n 30 >> .commit-context/diff_samples.txt
+              echo "" >> .commit-context/diff_samples.txt
+            done < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA" | head -n 20)
+
+            echo "large=true" >> "$GITHUB_OUTPUT"
+          else
+            # Small diff: keep the original truncated approach
+            head -c 60000 .commit-context/full.diff > .commit-context/diff.txt
+            echo "large=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "diff_lines=$DIFF_LINES"                         >> "$GITHUB_OUTPUT"
+          echo "diff_bytes=$(wc -c < .commit-context/full.diff)" >> "$GITHUB_OUTPUT"
 
       - name: Call AI for 2-line summary (Groq)
         id: ai_summary
@@ -75,8 +87,10 @@ jobs:
           # Override via repo variable GROQ_MODEL if you want, e.g. llama-3.3-70b-versatile,
           # llama-3.1-8b-instant, mixtral-8x7b-32768, gemma2-9b-it
           GROQ_MODEL: ${{ vars.GROQ_MODEL || 'llama-3.3-70b-versatile' }}
-          BRANCH: ${{ github.ref_name }}
-          PUSHER: ${{ github.actor }}
+          BRANCH: ${{ github.head_ref }}
+          PUSHER: ${{ github.event.pull_request.user.login }}
+          LARGE_DIFF: ${{ steps.changes.outputs.large }}
+          DIFF_LINES: ${{ steps.changes.outputs.diff_lines }}
         run: |
           set -euo pipefail
 
@@ -85,18 +99,37 @@ jobs:
             exit 1
           fi
 
-          DIFF_CONTENT=$(cat .commit-context/diff.txt)
           FILES_CONTENT=$(cat .commit-context/files.txt)
           MESSAGES_CONTENT=$(cat .commit-context/messages.txt)
 
-          # Build the user prompt text safely with jq
-          PROMPT=$(jq -n \
-            --arg branch  "$BRANCH" \
-            --arg pusher  "$PUSHER" \
-            --arg msgs    "$MESSAGES_CONTENT" \
-            --arg files   "$FILES_CONTENT" \
-            --arg diff    "$DIFF_CONTENT" \
-            '"Summarize the following push (one or more commits) in EXACTLY 2 concise lines (max ~220 chars total). Focus on what changed and why it matters. No bullet points, no markdown.\n\nBranch: " + $branch + "\nAuthor: " + $pusher + "\n\nCommit messages:\n" + $msgs + "\n\nChanged files:\n" + $files + "\n\nUnified diff (may be truncated):\n" + $diff')
+          # Build the user prompt text safely with jq.
+          # For large diffs (500+ lines) skip the raw diff to avoid overwhelming the model;
+          # use the overall stat summary + first-30-lines sample per file instead.
+          if [ "${LARGE_DIFF}" = "true" ]; then
+            echo "Large diff detected (${DIFF_LINES} lines) — using stat + per-file samples for prompt."
+            DIFF_STAT=$(cat .commit-context/diff_stat.txt)
+            DIFF_SAMPLES=$(cat .commit-context/diff_samples.txt)
+
+            PROMPT=$(jq -n \
+              --arg branch    "$BRANCH" \
+              --arg pusher    "$PUSHER" \
+              --arg lines     "$DIFF_LINES" \
+              --arg msgs      "$MESSAGES_CONTENT" \
+              --arg files     "$FILES_CONTENT" \
+              --arg stat      "$DIFF_STAT" \
+              --arg samples   "$DIFF_SAMPLES" \
+              '"Summarize this large push (" + $lines + " lines changed) in EXACTLY 2 concise lines (max ~220 chars total). Prioritize commit messages, then file stats, then the per-file samples. Focus on WHAT changed and WHY it matters. No bullet points, no markdown.\n\nBranch: " + $branch + "\nAuthor: " + $pusher + "\n\nCommit messages:\n" + $msgs + "\n\nChanged files (status + path):\n" + $files + "\n\nDiff statistics:\n" + $stat + "\n\nPer-file diff samples (first 30 lines each, up to 20 files):\n" + $samples')
+          else
+            DIFF_CONTENT=$(cat .commit-context/diff.txt)
+
+            PROMPT=$(jq -n \
+              --arg branch  "$BRANCH" \
+              --arg pusher  "$PUSHER" \
+              --arg msgs    "$MESSAGES_CONTENT" \
+              --arg files   "$FILES_CONTENT" \
+              --arg diff    "$DIFF_CONTENT" \
+              '"Summarize the following push (one or more commits) in EXACTLY 2 concise lines (max ~220 chars total). Focus on what changed and why it matters. No bullet points, no markdown.\n\nBranch: " + $branch + "\nAuthor: " + $pusher + "\n\nCommit messages:\n" + $msgs + "\n\nChanged files:\n" + $files + "\n\nUnified diff (may be truncated):\n" + $diff')
+          fi
 
           # Groq uses an OpenAI-compatible chat completions API
           PAYLOAD=$(jq -n \
@@ -140,18 +173,22 @@ jobs:
       - name: Extract Jira issue key
         id: jira_key
         env:
-          BRANCH: ${{ github.ref_name }}
+          BRANCH: ${{ github.head_ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
-          # Look for KEY-123 style ids in commit messages first, then branch name.
+          # Look for KEY-123 style ids in PR title, commit messages, PR body, then branch name.
           REGEX='[A-Z][A-Z0-9]+-[0-9]+'
           MESSAGES=$(cat .commit-context/messages.txt || true)
 
-          KEY=$(echo "$MESSAGES" | grep -oE "$REGEX" | head -n1 || true)
-          if [ -z "$KEY" ]; then KEY=$(echo "$BRANCH" | grep -oE "$REGEX" | head -n1 || true); fi
+          KEY=$(echo "$PR_TITLE" | grep -oE "$REGEX" | head -n1 || true)
+          if [ -z "$KEY" ]; then KEY=$(echo "$MESSAGES" | grep -oE "$REGEX" | head -n1 || true); fi
+          if [ -z "$KEY" ]; then KEY=$(echo "$PR_BODY"  | grep -oE "$REGEX" | head -n1 || true); fi
+          if [ -z "$KEY" ]; then KEY=$(echo "$BRANCH"   | grep -oE "$REGEX" | head -n1 || true); fi
 
           if [ -z "$KEY" ]; then
-            echo "No Jira issue key (e.g. ABC-123) found in commit messages or branch."
+            echo "No Jira issue key (e.g. ABC-123) found in PR title, commit messages, PR body, or branch."
             echo "found=false" >> "$GITHUB_OUTPUT"
           else
             echo "Found Jira key: $KEY"
