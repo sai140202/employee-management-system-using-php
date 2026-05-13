@@ -107,7 +107,10 @@ if($_SERVER["REQUEST_METHOD"] == "POST"){
         <?php 
         if(!empty($login_err)){
             echo '<div class="alert alert-danger">' . $login_err . '</div>';
-        }        
+        }
+        if(isset($_GET['reset']) && $_GET['reset'] == '1'){
+            echo '<div class="alert alert-success">Password reset successfully. Please log in.</div>';
+        }
         ?>
 
         <form action="<?php echo htmlspecialchars($_SERVER["PHP_SELF"]); ?>" method="post">
@@ -124,6 +127,7 @@ if($_SERVER["REQUEST_METHOD"] == "POST"){
             <div class="form-group">
                 <input type="submit" class="btn btn-primary" value="Login">
             </div>
+            <p>Forgot your password? <a href="forgot-password.php">Reset it here</a>.</p>
             <p>Don't have an account? <a href="register.php">Sign up now</a>.</p>
         </form>
     </div>
